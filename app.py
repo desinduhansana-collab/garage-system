@@ -1,128 +1,118 @@
 import streamlit as st
+import sqlite3
 import pandas as pd
-from streamlit_gsheets import GSheetsConnection
 from datetime import datetime
 
-# --- System Configuration ---
-LOW_STOCK_THRESHOLD = 3 
-# 👇 PASTE YOUR GOOGLE SHEET LINK INSIDE THESE QUOTES 👇
-SHEET_URL = "https://docs.google.com/spreadsheets/d/11JWwxG-HqdYAc_Fwz5QW5AntfEXkMHtmo9Eq6WAnCbI/edit?gid=0#gid=0"
+# --- 1. Database Setup (SQLite - Local History) ---
+conn = sqlite3.connect('garage_inventory.db')
+c = conn.cursor()
 
+# Table for Parts
+c.execute('''
+    CREATE TABLE IF NOT EXISTS parts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        barcode TEXT,
+        part_name TEXT NOT NULL,
+        category TEXT,
+        quantity INTEGER NOT NULL,
+        price REAL
+    )
+''')
+
+# Table for Sales History (This is where the history lives!)
+c.execute('''
+    CREATE TABLE IF NOT EXISTS sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        part_name TEXT NOT NULL,
+        quantity_sold INTEGER NOT NULL,
+        total_income REAL NOT NULL,
+        sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+conn.commit()
+
+# --- 2. The Web Page UI ---
+st.set_page_config(page_title="Desu's Garage", page_icon="🏍️")
 st.title("🏍️ Desu's Garage Management")
-st.caption("🟢 Live Cloud Database Connected")
 
-# --- 1. Connect to Google Sheets ---
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-# Fetch the live data (Now it knows exactly which sheet to read!)
-inventory_df = conn.read(spreadsheet=SHEET_URL, worksheet="Inventory", ttl=0).dropna(how="all")
-sales_df = conn.read(spreadsheet=SHEET_URL, worksheet="Sales", ttl=0).dropna(how="all")
+# Sidebar for Navigation
+menu = st.sidebar.selectbox("Go to Page", ["🛒 Checkout", "📦 Inventory", "📈 Sales History"])
 
 # ==========================================
-# SECTION: SMART ALERTS
+# PAGE 1: CHECKOUT (Selling Items)
 # ==========================================
-inventory_df['Quantity'] = pd.to_numeric(inventory_df['Quantity'], errors='coerce').fillna(0)
-low_stock_df = inventory_df[inventory_df['Quantity'] <= LOW_STOCK_THRESHOLD]
+if menu == "🛒 Checkout":
+    st.header("Sell Parts")
+    with st.form("sell_form", clear_on_submit=True):
+        scanned_barcode = st.text_input("Scan Barcode")
+        sell_qty = st.number_input("Quantity", min_value=1, value=1)
+        submit_sale = st.form_submit_button("Complete Sale")
 
-if not low_stock_df.empty:
-    st.error("⚠️ **LOW STOCK ALERT** ⚠️")
-    for index, row in low_stock_df.iterrows():
-        st.warning(f"Order more: **{row['Part_Name']}** (Only {int(row['Quantity'])} left!)")
-
-st.divider()
+        if submit_sale:
+            c.execute("SELECT id, part_name, quantity, price FROM parts WHERE barcode = ?", (scanned_barcode,))
+            item = c.fetchone()
+            
+            if item:
+                p_id, p_name, p_qty, p_price = item
+                if p_qty >= sell_qty:
+                    # 1. Update Inventory
+                    new_qty = p_qty - sell_qty
+                    c.execute("UPDATE parts SET quantity = ? WHERE id = ?", (new_qty, p_id))
+                    
+                    # 2. RECORD HISTORY (Save the sale!)
+                    income = p_price * sell_qty
+                    c.execute("INSERT INTO sales (part_name, quantity_sold, total_income) VALUES (?, ?, ?)", 
+                              (p_name, sell_qty, income))
+                    conn.commit()
+                    st.success(f"Sold {sell_qty}x {p_name} for Rs. {income:,.2f}")
+                else:
+                    st.error("Not enough stock!")
+            else:
+                st.error("Item not found in inventory.")
 
 # ==========================================
-# SECTION: CHECKOUT / SELL PARTS
+# PAGE 2: INVENTORY (Adding/Viewing Stock)
 # ==========================================
-st.subheader("🛒 Checkout / Sell Parts")
-with st.form("sell_part_form", clear_on_submit=True):
-    sell_barcode = st.text_input("Scan Barcode / Enter Part Number")
-    sell_qty = st.number_input("Quantity to Sell", min_value=1, value=1, step=1)
-    sell_submitted = st.form_submit_button("Complete Sale")
+elif menu == "📦 Inventory":
+    st.header("Inventory Management")
+    
+    with st.expander("Add New Part"):
+        with st.form("add_form", clear_on_submit=True):
+            b = st.text_input("Barcode")
+            n = st.text_input("Part Name")
+            cat = st.selectbox("Category", ["Oil", "Tires", "Brakes", "Other"])
+            q = st.number_input("Quantity", min_value=1)
+            p = st.number_input("Price (Rs.)")
+            if st.form_submit_button("Save"):
+                c.execute("INSERT INTO parts (barcode, part_name, category, quantity, price) VALUES (?,?,?,?,?)", (b, n, cat, q, p))
+                conn.commit()
+                st.success("Part Added!")
 
-    if sell_submitted and sell_barcode != "":
-        match = inventory_df[inventory_df['Barcode'].astype(str) == str(sell_barcode)]
+    st.subheader("Current Stock")
+    df = pd.read_sql("SELECT * FROM parts", conn)
+    st.dataframe(df, use_container_width=True)
+
+# ==========================================
+# PAGE 3: SALES HISTORY (The Income Tracker)
+# ==========================================
+elif menu == "📈 Sales History":
+    st.header("Garage Performance")
+    
+    # Load all sales data from the 'sales' table
+    sales_df = pd.read_sql("SELECT * FROM sales ORDER BY sale_date DESC", conn)
+    
+    if not sales_df.empty:
+        # Calculate Total Revenue
+        total_rev = sales_df['total_income'].sum()
+        st.metric("Total Revenue", f"Rs. {total_rev:,.2f}")
         
-        if not match.empty:
-            idx = match.index[0] 
-            part_name = inventory_df.at[idx, 'Part_Name']
-            current_qty = inventory_df.at[idx, 'Quantity']
-            price = float(inventory_df.at[idx, 'Price'])
+        # Show the list of every single sale ever made
+        st.subheader("Detailed History")
+        st.dataframe(sales_df, use_container_width=True)
+        
+        # Download button to save history as an Excel file
+        st.download_button("Download Report (CSV)", sales_df.to_csv(index=False), "garage_report.csv")
+    else:
+        st.info("No sales have been recorded yet.")
 
-            if current_qty >= sell_qty:
-                new_qty = current_qty - sell_qty
-                inventory_df.at[idx, 'Quantity'] = new_qty
-                # Tell it which sheet to update!
-                conn.update(spreadsheet=SHEET_URL, worksheet="Inventory", data=inventory_df)
-                
-                total_income = price * sell_qty
-                new_sale = pd.DataFrame([{
-                    "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Part_Name": part_name,
-                    "Qty_Sold": sell_qty,
-                    "Income": total_income
-                }])
-                updated_sales = pd.concat([sales_df, new_sale], ignore_index=True)
-                # Tell it which sheet to update!
-                conn.update(spreadsheet=SHEET_URL, worksheet="Sales", data=updated_sales)
-                
-                st.success(f"✅ Sold {sell_qty}x {part_name} for Rs.{total_income:.2f}.")
-                st.rerun() 
-            else:
-                st.error(f"❌ Not enough stock! You only have {int(current_qty)} left.")
-        else:
-            st.error("❌ Barcode not found.")
-
-# ==========================================
-# SECTION: ADD NEW PARTS
-# ==========================================
-with st.expander("➕ Add New Parts to Inventory"): 
-    with st.form("add_part_form", clear_on_submit=True):
-        barcode = st.text_input("Barcode / Part Number")
-        part_name = st.text_input("Part Name")
-        category = st.selectbox("Category", ["Engine Oil", "Brakes", "Tires", "Engine Parts", "Accessories", "Other"])
-        quantity = st.number_input("Quantity to Add", min_value=1, value=1, step=1)
-        price = st.number_input("Price (Rs.)", min_value=0.0, format="%f")
-        add_submitted = st.form_submit_button("Save Part")
-
-        if add_submitted and part_name != "":
-            match = inventory_df[inventory_df['Barcode'].astype(str) == str(barcode)]
-            
-            if not match.empty and barcode != "":
-                idx = match.index[0]
-                inventory_df.at[idx, 'Quantity'] += quantity
-                st.success(f"Added {quantity} more to existing stock!")
-            else:
-                new_id = len(inventory_df) + 1
-                new_item = pd.DataFrame([{
-                    "ID": new_id, "Barcode": str(barcode), "Part_Name": part_name, 
-                    "Category": category, "Quantity": quantity, "Price": price
-                }])
-                inventory_df = pd.concat([inventory_df, new_item], ignore_index=True)
-                st.success(f"Added {part_name} to inventory!")
-            
-            # Tell it which sheet to update!
-            conn.update(spreadsheet=SHEET_URL, worksheet="Inventory", data=inventory_df)
-            st.rerun()
-
-# ==========================================
-# SECTION: VIEW DATA
-# ==========================================
-st.subheader("📦 Current Inventory")
-if not inventory_df.empty:
-    display_df = inventory_df.copy()
-    display_df.insert(0, "Status", ["🔴 Low" if q <= LOW_STOCK_THRESHOLD else "🟢 Good" for q in display_df['Quantity']])
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-else:
-    st.info("Inventory is empty.")
-
-st.divider()
-st.subheader("📈 Sales History")
-if not sales_df.empty:
-    sales_df['Income'] = pd.to_numeric(sales_df['Income'], errors='coerce').fillna(0)
-    total_rev = sales_df['Income'].sum()
-    st.metric(label="Total Garage Revenue", value=f"Rs. {total_rev:,.2f}")
-    st.dataframe(sales_df.sort_values(by="Date", ascending=False), use_container_width=True, hide_index=True)
-else:
-    st.metric(label="Total Garage Revenue", value="Rs. 0.00")
-    st.info("No sales recorded yet.")
+conn.close()
