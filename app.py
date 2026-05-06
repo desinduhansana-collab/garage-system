@@ -1,55 +1,33 @@
 import streamlit as st
-import sqlite3
+import pandas as pd
+from streamlit_gsheets import GSheetsConnection
 from datetime import datetime
 
 # --- System Configuration ---
-# You can change this number! If stock hits this number, the alarm sounds.
 LOW_STOCK_THRESHOLD = 3 
 
-# --- 1. Database Setup ---
-conn = sqlite3.connect('garage_inventory.db')
-c = conn.cursor()
-
-c.execute('''
-    CREATE TABLE IF NOT EXISTS parts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        part_name TEXT NOT NULL,
-        category TEXT,
-        quantity INTEGER NOT NULL,
-        price REAL
-    )
-''')
-try:
-    c.execute('ALTER TABLE parts ADD COLUMN barcode TEXT')
-except sqlite3.OperationalError:
-    pass 
-
-c.execute('''
-    CREATE TABLE IF NOT EXISTS sales (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        part_name TEXT NOT NULL,
-        quantity_sold INTEGER NOT NULL,
-        total_price REAL NOT NULL,
-        sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-conn.commit()
-
-# --- 2. The Web Page ---
 st.title("🏍️ Desu's Garage Management")
+st.caption("🟢 Live Cloud Database Connected")
+
+# --- 1. Connect to Google Sheets ---
+# This looks at the Secrets you saved in Streamlit to securely log in
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+# Fetch the live data (ttl=0 means it never uses old cached data)
+inventory_df = conn.read(worksheet="Inventory", ttl=0).dropna(how="all")
+sales_df = conn.read(worksheet="Sales", ttl=0).dropna(how="all")
 
 # ==========================================
-# NEW SECTION: SMART ALERTS
+# SECTION: SMART ALERTS
 # ==========================================
-# We check the database specifically for items running out
-c.execute("SELECT part_name, quantity FROM parts WHERE quantity <= ?", (LOW_STOCK_THRESHOLD,))
-low_stock_items = c.fetchall()
+# Convert quantity column to numbers just in case, then check for low stock
+inventory_df['Quantity'] = pd.to_numeric(inventory_df['Quantity'], errors='coerce').fillna(0)
+low_stock_df = inventory_df[inventory_df['Quantity'] <= LOW_STOCK_THRESHOLD]
 
-# If the list is not empty, trigger the red warning boxes!
-if len(low_stock_items) > 0:
+if not low_stock_df.empty:
     st.error("⚠️ **LOW STOCK ALERT** ⚠️")
-    for item in low_stock_items:
-        st.warning(f"Order more: **{item[0]}** (Only {item[1]} left in stock!)")
+    for index, row in low_stock_df.iterrows():
+        st.warning(f"Order more: **{row['Part_Name']}** (Only {int(row['Quantity'])} left!)")
 
 st.divider()
 
@@ -62,38 +40,39 @@ with st.form("sell_part_form", clear_on_submit=True):
     sell_qty = st.number_input("Quantity to Sell", min_value=1, value=1, step=1)
     sell_submitted = st.form_submit_button("Complete Sale")
 
-    if sell_submitted:
-        if sell_barcode != "":
-            c.execute("SELECT id, part_name, quantity, price FROM parts WHERE barcode = ?", (sell_barcode,))
-            part = c.fetchone() 
+    if sell_submitted and sell_barcode != "":
+        # Look for the barcode in the spreadsheet
+        match = inventory_df[inventory_df['Barcode'].astype(str) == str(sell_barcode)]
+        
+        if not match.empty:
+            idx = match.index[0] # Get the row number
+            part_name = inventory_df.at[idx, 'Part_Name']
+            current_qty = inventory_df.at[idx, 'Quantity']
+            price = float(inventory_df.at[idx, 'Price'])
 
-            if part:
-                part_id = part[0]
-                part_name = part[1]
-                current_qty = part[2]
-                part_price = part[3] 
-
-                if current_qty >= sell_qty:
-                    new_qty = current_qty - sell_qty
-                    c.execute("UPDATE parts SET quantity = ? WHERE id = ?", (new_qty, part_id))
-                    
-                    total_sale_value = part_price * sell_qty
-                    c.execute("INSERT INTO sales (part_name, quantity_sold, total_price, sale_date) VALUES (?, ?, ?, datetime('now', 'localtime'))", 
-                              (part_name, sell_qty, total_sale_value))
-                    conn.commit()
-                    
-                    # Check if this sale just triggered a low stock warning!
-                    if new_qty <= LOW_STOCK_THRESHOLD:
-                        st.success(f"✅ Sale Successful! Sold {sell_qty}x {part_name}.")
-                        st.error(f"🚨 Heads up! {part_name} is now low on stock ({new_qty} left).")
-                    else:
-                        st.success(f"✅ Sale Successful! Sold {sell_qty}x {part_name} for Rs.{total_sale_value:.2f}.")
-                else:
-                    st.error(f"❌ Not enough stock! You only have {current_qty} of {part_name} left.")
+            if current_qty >= sell_qty:
+                # 1. Update the inventory quantity
+                new_qty = current_qty - sell_qty
+                inventory_df.at[idx, 'Quantity'] = new_qty
+                conn.update(worksheet="Inventory", data=inventory_df)
+                
+                # 2. Record the sale
+                total_income = price * sell_qty
+                new_sale = pd.DataFrame([{
+                    "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Part_Name": part_name,
+                    "Qty_Sold": sell_qty,
+                    "Income": total_income
+                }])
+                updated_sales = pd.concat([sales_df, new_sale], ignore_index=True)
+                conn.update(worksheet="Sales", data=updated_sales)
+                
+                st.success(f"✅ Sold {sell_qty}x {part_name} for Rs.{total_income:.2f}.")
+                st.rerun() # Refresh the page to show new data
             else:
-                st.error("❌ Barcode not found in the system.")
+                st.error(f"❌ Not enough stock! You only have {int(current_qty)} left.")
         else:
-            st.warning("Please enter or scan a barcode to sell.")
+            st.error("❌ Barcode not found.")
 
 # ==========================================
 # SECTION: ADD NEW PARTS
@@ -101,75 +80,52 @@ with st.form("sell_part_form", clear_on_submit=True):
 with st.expander("➕ Add New Parts to Inventory"): 
     with st.form("add_part_form", clear_on_submit=True):
         barcode = st.text_input("Barcode / Part Number")
-        part_name = st.text_input("Part Name (e.g., Honda Brake Pads)")
+        part_name = st.text_input("Part Name")
         category = st.selectbox("Category", ["Engine Oil", "Brakes", "Tires", "Engine Parts", "Accessories", "Other"])
         quantity = st.number_input("Quantity to Add", min_value=1, value=1, step=1)
         price = st.number_input("Price (Rs.)", min_value=0.0, format="%f")
-        add_submitted = st.form_submit_button("Save Part to Inventory")
+        add_submitted = st.form_submit_button("Save Part")
 
         if add_submitted and part_name != "":
-            c.execute("SELECT id, quantity FROM parts WHERE barcode = ? AND barcode != ''", (barcode,))
-            existing_part = c.fetchone()
-            if existing_part:
-                new_total = existing_part[1] + quantity
-                c.execute("UPDATE parts SET quantity = ? WHERE id = ?", (new_total, existing_part[0]))
-                st.success(f"Updated existing part! Added {quantity} more to stock.")
+            match = inventory_df[inventory_df['Barcode'].astype(str) == str(barcode)]
+            
+            if not match.empty and barcode != "":
+                # Update existing part
+                idx = match.index[0]
+                inventory_df.at[idx, 'Quantity'] += quantity
+                st.success(f"Added {quantity} more to existing stock!")
             else:
-                c.execute("INSERT INTO parts (barcode, part_name, category, quantity, price) VALUES (?, ?, ?, ?, ?)", 
-                          (barcode, part_name, category, quantity, price))
-                st.success(f"Successfully added {quantity}x {part_name} to the system!")
-            conn.commit()
+                # Create a brand new row
+                new_id = len(inventory_df) + 1
+                new_item = pd.DataFrame([{
+                    "ID": new_id, "Barcode": str(barcode), "Part_Name": part_name, 
+                    "Category": category, "Quantity": quantity, "Price": price
+                }])
+                inventory_df = pd.concat([inventory_df, new_item], ignore_index=True)
+                st.success(f"Added {part_name} to inventory!")
+            
+            conn.update(worksheet="Inventory", data=inventory_df)
+            st.rerun()
 
 # ==========================================
-# SECTION: VIEW INVENTORY
+# SECTION: VIEW DATA
 # ==========================================
 st.subheader("📦 Current Inventory")
-c.execute("SELECT * FROM parts")
-rows = c.fetchall()
-
-if len(rows) > 0:
-    inventory_data = []
-    for row in rows:
-        qty = row[3]
-        # Assign a visual status based on the threshold
-        if qty <= LOW_STOCK_THRESHOLD:
-            status = "🔴 Low Stock"
-        else:
-            status = "🟢 Good"
-            
-        inventory_data.append({
-            "Status": status,
-            "Barcode": row[5] if len(row) > 5 else "N/A", 
-            "Part Name": row[1], 
-            "Category": row[2], 
-            "Qty": qty, 
-            "Price (Rs.)": row[4]
-        })
-    st.dataframe(inventory_data, use_container_width=True)
+if not inventory_df.empty:
+    # Add the status emoji for the visual table
+    display_df = inventory_df.copy()
+    display_df.insert(0, "Status", ["🔴 Low" if q <= LOW_STOCK_THRESHOLD else "🟢 Good" for q in display_df['Quantity']])
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 else:
-    st.info("Your inventory is empty.")
+    st.info("Inventory is empty.")
 
-# ==========================================
-# SECTION: SALES HISTORY & INCOME
-# ==========================================
+st.divider()
 st.subheader("📈 Sales History")
-
-c.execute("SELECT SUM(total_price) FROM sales")
-total_income = c.fetchone()[0]
-if total_income:
-    st.metric(label="Total Garage Revenue", value=f"Rs. {total_income:,.2f}")
+if not sales_df.empty:
+    sales_df['Income'] = pd.to_numeric(sales_df['Income'], errors='coerce').fillna(0)
+    total_rev = sales_df['Income'].sum()
+    st.metric(label="Total Garage Revenue", value=f"Rs. {total_rev:,.2f}")
+    st.dataframe(sales_df.sort_values(by="Date", ascending=False), use_container_width=True, hide_index=True)
 else:
     st.metric(label="Total Garage Revenue", value="Rs. 0.00")
-
-c.execute("SELECT part_name, quantity_sold, total_price, sale_date FROM sales ORDER BY sale_date DESC")
-sales_rows = c.fetchall()
-
-if len(sales_rows) > 0:
-    sales_data = []
-    for row in sales_rows:
-        sales_data.append({"Date & Time": row[3], "Part Sold": row[0], "Qty": row[1], "Income (Rs.)": row[2]})
-    st.dataframe(sales_data, use_container_width=True)
-else:
     st.info("No sales recorded yet.")
-
-conn.close()
