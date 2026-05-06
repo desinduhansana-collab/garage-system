@@ -5,22 +5,22 @@ from datetime import datetime
 
 # --- System Configuration ---
 LOW_STOCK_THRESHOLD = 3 
+# 👇 PASTE YOUR GOOGLE SHEET LINK INSIDE THESE QUOTES 👇
+SHEET_URL = "https://docs.google.com/spreadsheets/d/11JWwxG-HqdYAc_Fwz5QW5AntfEXkMHtmo9Eq6WAnCbI/edit?gid=0#gid=0"
 
 st.title("🏍️ Desu's Garage Management")
 st.caption("🟢 Live Cloud Database Connected")
 
 # --- 1. Connect to Google Sheets ---
-# This looks at the Secrets you saved in Streamlit to securely log in
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Fetch the live data (ttl=0 means it never uses old cached data)
-inventory_df = conn.read(worksheet="Inventory", ttl=0).dropna(how="all")
-sales_df = conn.read(worksheet="Sales", ttl=0).dropna(how="all")
+# Fetch the live data (Now it knows exactly which sheet to read!)
+inventory_df = conn.read(spreadsheet=SHEET_URL, worksheet="Inventory", ttl=0).dropna(how="all")
+sales_df = conn.read(spreadsheet=SHEET_URL, worksheet="Sales", ttl=0).dropna(how="all")
 
 # ==========================================
 # SECTION: SMART ALERTS
 # ==========================================
-# Convert quantity column to numbers just in case, then check for low stock
 inventory_df['Quantity'] = pd.to_numeric(inventory_df['Quantity'], errors='coerce').fillna(0)
 low_stock_df = inventory_df[inventory_df['Quantity'] <= LOW_STOCK_THRESHOLD]
 
@@ -41,22 +41,20 @@ with st.form("sell_part_form", clear_on_submit=True):
     sell_submitted = st.form_submit_button("Complete Sale")
 
     if sell_submitted and sell_barcode != "":
-        # Look for the barcode in the spreadsheet
         match = inventory_df[inventory_df['Barcode'].astype(str) == str(sell_barcode)]
         
         if not match.empty:
-            idx = match.index[0] # Get the row number
+            idx = match.index[0] 
             part_name = inventory_df.at[idx, 'Part_Name']
             current_qty = inventory_df.at[idx, 'Quantity']
             price = float(inventory_df.at[idx, 'Price'])
 
             if current_qty >= sell_qty:
-                # 1. Update the inventory quantity
                 new_qty = current_qty - sell_qty
                 inventory_df.at[idx, 'Quantity'] = new_qty
-                conn.update(worksheet="Inventory", data=inventory_df)
+                # Tell it which sheet to update!
+                conn.update(spreadsheet=SHEET_URL, worksheet="Inventory", data=inventory_df)
                 
-                # 2. Record the sale
                 total_income = price * sell_qty
                 new_sale = pd.DataFrame([{
                     "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -65,10 +63,11 @@ with st.form("sell_part_form", clear_on_submit=True):
                     "Income": total_income
                 }])
                 updated_sales = pd.concat([sales_df, new_sale], ignore_index=True)
-                conn.update(worksheet="Sales", data=updated_sales)
+                # Tell it which sheet to update!
+                conn.update(spreadsheet=SHEET_URL, worksheet="Sales", data=updated_sales)
                 
                 st.success(f"✅ Sold {sell_qty}x {part_name} for Rs.{total_income:.2f}.")
-                st.rerun() # Refresh the page to show new data
+                st.rerun() 
             else:
                 st.error(f"❌ Not enough stock! You only have {int(current_qty)} left.")
         else:
@@ -90,12 +89,10 @@ with st.expander("➕ Add New Parts to Inventory"):
             match = inventory_df[inventory_df['Barcode'].astype(str) == str(barcode)]
             
             if not match.empty and barcode != "":
-                # Update existing part
                 idx = match.index[0]
                 inventory_df.at[idx, 'Quantity'] += quantity
                 st.success(f"Added {quantity} more to existing stock!")
             else:
-                # Create a brand new row
                 new_id = len(inventory_df) + 1
                 new_item = pd.DataFrame([{
                     "ID": new_id, "Barcode": str(barcode), "Part_Name": part_name, 
@@ -104,7 +101,8 @@ with st.expander("➕ Add New Parts to Inventory"):
                 inventory_df = pd.concat([inventory_df, new_item], ignore_index=True)
                 st.success(f"Added {part_name} to inventory!")
             
-            conn.update(worksheet="Inventory", data=inventory_df)
+            # Tell it which sheet to update!
+            conn.update(spreadsheet=SHEET_URL, worksheet="Inventory", data=inventory_df)
             st.rerun()
 
 # ==========================================
@@ -112,7 +110,6 @@ with st.expander("➕ Add New Parts to Inventory"):
 # ==========================================
 st.subheader("📦 Current Inventory")
 if not inventory_df.empty:
-    # Add the status emoji for the visual table
     display_df = inventory_df.copy()
     display_df.insert(0, "Status", ["🔴 Low" if q <= LOW_STOCK_THRESHOLD else "🟢 Good" for q in display_df['Quantity']])
     st.dataframe(display_df, use_container_width=True, hide_index=True)
