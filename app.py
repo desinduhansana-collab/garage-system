@@ -8,7 +8,7 @@ import hashlib
 MASTER_EMAIL = "desinduhansana@gmail.com"
 # 👇 PASTE YOUR GOOGLE SHEET LINK HERE 👇
 SHEET_URL = "PASTE_YOUR_GOOGLE_SHEET_URL_HERE"
-# https://docs.google.com/spreadsheets/d/11JWwxG-HqdYAc_Fwz5QW5AntfEXkMHtmo9Eq6WAnCbI/edit?usp=sharing
+# "https://docs.google.com/spreadsheets/d/11JWwxG-HqdYAc_Fwz5QW5AntfEXkMHtmo9Eq6WAnCbI/edit?gid=0#gid=0"
 st.set_page_config(page_title="Desu's Garage Management", layout="wide")
 
 # Connect to Google Sheets
