@@ -2,117 +2,151 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime
+import hashlib
 
-# --- 1. Database Setup (SQLite - Local History) ---
-conn = sqlite3.connect('garage_inventory.db')
+# --- 1. DATABASE & SECURITY SETUP ---
+conn = sqlite3.connect('garage_management.db', check_same_thread=False)
 c = conn.cursor()
 
-# Table for Parts
-c.execute('''
-    CREATE TABLE IF NOT EXISTS parts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        barcode TEXT,
-        part_name TEXT NOT NULL,
-        category TEXT,
-        quantity INTEGER NOT NULL,
-        price REAL
-    )
-''')
-
-# Table for Sales History (This is where the history lives!)
-c.execute('''
-    CREATE TABLE IF NOT EXISTS sales (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        part_name TEXT NOT NULL,
-        quantity_sold INTEGER NOT NULL,
-        total_income REAL NOT NULL,
-        sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-''')
+# Create Tables
+c.execute('CREATE TABLE IF NOT EXISTS parts (id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT UNIQUE, part_name TEXT, category TEXT, quantity INTEGER, cost_price REAL, selling_price REAL)')
+c.execute('CREATE TABLE IF NOT EXISTS sales (id INTEGER PRIMARY KEY AUTOINCREMENT, part_name TEXT, qty_sold INTEGER, sale_total REAL, profit REAL, sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+# NEW: Users Table with Approval Status
+c.execute('''CREATE TABLE IF NOT EXISTS users 
+             (email TEXT PRIMARY KEY, password TEXT, role TEXT, status TEXT)''')
 conn.commit()
 
-# --- 2. The Web Page UI ---
-st.set_page_config(page_title="Desu's Garage", page_icon="🏍️")
-st.title("🏍️ Desu's Garage Management")
+def make_hashes(password):
+    return hashlib.sha256(str.encode(password)).hexdigest()
 
-# Sidebar for Navigation
-menu = st.sidebar.selectbox("Go to Page", ["🛒 Checkout", "📦 Inventory", "📈 Sales History"])
+def check_hashes(password, hashed_text):
+    if make_hashes(password) == hashed_text:
+        return hashed_text
+    return False
 
-# ==========================================
-# PAGE 1: CHECKOUT (Selling Items)
-# ==========================================
-if menu == "🛒 Checkout":
-    st.header("Sell Parts")
-    with st.form("sell_form", clear_on_submit=True):
-        scanned_barcode = st.text_input("Scan Barcode")
-        sell_qty = st.number_input("Quantity", min_value=1, value=1)
-        submit_sale = st.form_submit_button("Complete Sale")
+# Master Admin Email
+MASTER_EMAIL = "desinduhansana@gmail.com"
 
-        if submit_sale:
-            c.execute("SELECT id, part_name, quantity, price FROM parts WHERE barcode = ?", (scanned_barcode,))
-            item = c.fetchone()
-            
-            if item:
-                p_id, p_name, p_qty, p_price = item
-                if p_qty >= sell_qty:
-                    # 1. Update Inventory
-                    new_qty = p_qty - sell_qty
-                    c.execute("UPDATE parts SET quantity = ? WHERE id = ?", (new_qty, p_id))
-                    
-                    # 2. RECORD HISTORY (Save the sale!)
-                    income = p_price * sell_qty
-                    c.execute("INSERT INTO sales (part_name, quantity_sold, total_income) VALUES (?, ?, ?)", 
-                              (p_name, sell_qty, income))
-                    conn.commit()
-                    st.success(f"Sold {sell_qty}x {p_name} for Rs. {income:,.2f}")
+# --- 2. LOGIN & REGISTRATION SYSTEM ---
+def login_page():
+    st.title("🔐 Garage Management Login")
+    
+    tab1, tab2 = st.tabs(["Login", "Register New Staff"])
+    
+    with tab1:
+        email = st.text_input("Email")
+        password = st.text_input("Password", type='password')
+        if st.button("Login"):
+            c.execute('SELECT password, role, status FROM users WHERE email = ?', (email,))
+            data = f = c.fetchone()
+            if data:
+                if check_hashes(password, data[0]):
+                    if data[2] == "Approved" or email == MASTER_EMAIL:
+                        st.session_state.logged_in = True
+                        st.session_state.user_email = email
+                        st.session_state.user_role = data[1]
+                        st.success(f"Welcome {email}")
+                        st.rerun()
+                    else:
+                        st.warning("⏳ Your account is pending approval from Desu.")
                 else:
-                    st.error("Not enough stock!")
+                    st.error("Incorrect Password")
             else:
-                st.error("Item not found in inventory.")
+                st.error("Email not found")
 
-# ==========================================
-# PAGE 2: INVENTORY (Adding/Viewing Stock)
-# ==========================================
-elif menu == "📦 Inventory":
-    st.header("Inventory Management")
-    
-    with st.expander("Add New Part"):
-        with st.form("add_form", clear_on_submit=True):
-            b = st.text_input("Barcode")
-            n = st.text_input("Part Name")
-            cat = st.selectbox("Category", ["Oil", "Tires", "Brakes", "Other"])
-            q = st.number_input("Quantity", min_value=1)
-            p = st.number_input("Price (Rs.)")
-            if st.form_submit_button("Save"):
-                c.execute("INSERT INTO parts (barcode, part_name, category, quantity, price) VALUES (?,?,?,?,?)", (b, n, cat, q, p))
+    with tab2:
+        new_email = st.text_input("Staff Email")
+        new_pw = st.text_input("Staff Password", type='password')
+        if st.button("Request Access"):
+            try:
+                # Master email is automatically approved, others are pending
+                status = "Approved" if new_email == MASTER_EMAIL else "Pending"
+                role = "Admin" if new_email == MASTER_EMAIL else "Staff"
+                c.execute('INSERT INTO users(email,password,role,status) VALUES (?,?,?,?)',
+                          (new_email, make_hashes(new_pw), role, status))
                 conn.commit()
-                st.success("Part Added!")
+                st.success("Registration Sent! Please wait for Desu to approve you.")
+            except:
+                st.error("User already exists.")
 
-    st.subheader("Current Stock")
-    df = pd.read_sql("SELECT * FROM parts", conn)
-    st.dataframe(df, use_container_width=True)
+# --- 3. MAIN APP LOGIC ---
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-# ==========================================
-# PAGE 3: SALES HISTORY (The Income Tracker)
-# ==========================================
-elif menu == "📈 Sales History":
-    st.header("Garage Performance")
+if not st.session_state.logged_in:
+    login_page()
+else:
+    # Sidebar Navigation
+    st.sidebar.title("🛠️ Menu")
+    st.sidebar.write(f"User: {st.session_state.user_email}")
     
-    # Load all sales data from the 'sales' table
-    sales_df = pd.read_sql("SELECT * FROM sales ORDER BY sale_date DESC", conn)
-    
-    if not sales_df.empty:
-        # Calculate Total Revenue
-        total_rev = sales_df['total_income'].sum()
-        st.metric("Total Revenue", f"Rs. {total_rev:,.2f}")
+    # MASTER ONLY: Approval Center
+    if st.session_state.user_email == MASTER_EMAIL:
+        if st.sidebar.checkbox("⭐ Admin Approval Center"):
+            st.header("Admin Approval Center")
+            users_df = pd.read_sql("SELECT email, role, status FROM users WHERE email != ?", conn, params=(MASTER_EMAIL,))
+            st.dataframe(users_df)
+            
+            email_to_approve = st.selectbox("Select Email to Approve", users_df['email'])
+            if st.button("Approve User"):
+                c.execute("UPDATE users SET status = 'Approved' WHERE email = ?", (email_to_approve,))
+                conn.commit()
+                st.success(f"{email_to_approve} can now access the app!")
+                st.rerun()
+
+    page = st.sidebar.radio("Navigate to:", ["🛒 Checkout", "📦 Inventory", "📈 Profits"])
+
+    # --- CHECKOUT PAGE ---
+    if page == "🛒 Checkout":
+        st.header("🛒 Sales")
+        # 
+        with st.form("sale"):
+            bc = st.text_input("Barcode")
+            qty = st.number_input("Qty", min_value=1)
+            if st.form_submit_button("Complete Sale"):
+                c.execute("SELECT id, part_name, quantity, cost_price, selling_price FROM parts WHERE barcode = ?", (bc,))
+                item = c.fetchone()
+                if item and item[2] >= qty:
+                    revenue = item[4] * qty
+                    profit = (item[4] - item[3]) * qty
+                    c.execute("UPDATE parts SET quantity = ? WHERE id = ?", (item[2]-qty, item[0]))
+                    c.execute("INSERT INTO sales (part_name, qty_sold, sale_total, profit) VALUES (?,?,?,?)", (item[1], qty, revenue, profit))
+                    conn.commit()
+                    st.success("Sale Successful!")
+                else:
+                    st.error("Stock Error or Item Not Found")
+
+    # --- INVENTORY PAGE ---
+    elif page == "📦 Inventory":
+        st.header("📦 Stock")
+        # Only Master/Approved Management can add/edit
+        with st.expander("Add/Update Stock"):
+            with st.form("inv"):
+                b = st.text_input("Barcode")
+                n = st.text_input("Name")
+                q = st.number_input("Qty", min_value=1)
+                cp = st.number_input("Cost")
+                sp = st.number_input("Sell")
+                if st.form_submit_button("Save"):
+                    c.execute("INSERT OR REPLACE INTO parts (barcode, part_name, quantity, cost_price, selling_price) VALUES (?,?,?,?,?)", (b,n,q,cp,sp))
+                    conn.commit()
+                    st.success("Inventory Updated")
         
-        # Show the list of every single sale ever made
-        st.subheader("Detailed History")
-        st.dataframe(sales_df, use_container_width=True)
-        
-        # Download button to save history as an Excel file
-        st.download_button("Download Report (CSV)", sales_df.to_csv(index=False), "garage_report.csv")
-    else:
-        st.info("No sales have been recorded yet.")
+        st.dataframe(pd.read_sql("SELECT * FROM parts", conn), use_container_width=True)
+
+    # --- PROFITS PAGE ---
+    elif page == "📈 Profits":
+        if st.session_state.user_email == MASTER_EMAIL:
+            st.header("📈 Master Financials")
+            sales = pd.read_sql("SELECT * FROM sales", conn)
+            st.metric("Total Revenue", f"Rs. {sales['sale_total'].sum():,.2f}")
+            st.metric("Total Profit", f"Rs. {sales['profit'].sum():,.2f}")
+            st.dataframe(sales)
+        else:
+            st.warning("🚫 Only the Master Admin can see financial reports.")
+
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.rerun()
 
 conn.close()
