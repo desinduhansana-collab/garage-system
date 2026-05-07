@@ -6,7 +6,7 @@ import hashlib
 
 MASTER_EMAIL = "desinduhansana@gmail.com"
 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/11JWwxG-HqdYAc_FwZ5QW5AntfEXkMHtmo9Eq6WAnCbl/edit?gid=0#gid=0"
+SHEET_URL = "https://docs.google.com/spreadsheets/d/11JWwxG-HqdYAc_FwZ5QW5AntfEXkMHtmo9Eq6WAnCbl/edit" 
 
 st.set_page_config(
     page_title="Desu's Garage Management",
